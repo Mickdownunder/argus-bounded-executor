@@ -1,98 +1,63 @@
 # argus-bounded-executor
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/Mickdownunder/argus-bounded-executor/actions/workflows/tests.yml/badge.svg)](https://github.com/Mickdownunder/argus-bounded-executor/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/github/v/tag/Mickdownunder/argus-bounded-executor?label=release)](https://github.com/Mickdownunder/argus-bounded-executor/releases)
+[![License: Apache-2.0](https://img.shields.io/github/license/Mickdownunder/argus-bounded-executor)](LICENSE)
 [![Stack Setup](https://img.shields.io/badge/docs-stack%20setup-black.svg)](https://github.com/Mickdownunder/operator-control-plane/blob/main/docs/STACK_SETUP.md)
 
-Kurz auf Deutsch: `argus-bounded-executor` ist die begrenzte
-Ausfuehrungsschicht des Stacks. ARGUS fuehrt delegierte Arbeit unter klaren
-Laufzeit-, Identitaets- und Dispatch-Grenzen aus und liefert ein sauberes
-Ergebnisartefakt an Operator zurueck.
+`argus-bounded-executor` is the bounded execution layer in the
+`operator-control-plane` stack. ARGUS turns delegated execution requests into
+auditable, runtime-bounded attempts with an explicit result contract.
 
-`argus-bounded-executor` is the bounded execution layer of the public stack.
-ARGUS does not own project truth or planning authority. Its job is to turn a
-delegated execution request into a controlled attempt with explicit identity
-binding, runtime boundaries, and a canonical result contract that Operator can
-ingest.
+## What ARGUS Does
 
-## What ARGUS Actually Does
+- Executes bounded plans (`status`, `research`, `full`, `mini`) via
+  `bin/argus-research-run`
+- Enforces identity binding (mission/dispatch/project) and duplicate-dispatch
+  locks
+- Delegates validation to ATLAS when needed via `bin/argus-delegate-atlas`
+- Emits canonical execution output (`argus_result.json`)
 
-ARGUS exposes bounded execution entrypoints such as:
+## What ARGUS Does Not Do
 
-- `bin/argus-research-run`
-- `bin/argus-delegate-atlas`
+- Does not own project truth (Operator does)
+- Does not own mission orchestration or dispatch truth (June does)
+- Does not act as a planner or policy authority
 
-Those entrypoints:
+## Quickstart
 
-- accept a bounded plan such as `status`, `research`, `full`, or `mini`
-- validate mission, dispatch, and optional project bindings
-- acquire dispatch locks to prevent duplicate active execution
-- run Operator entrypoints under bounded runtime control
-- optionally delegate the validation leg to ATLAS
-- emit a canonical `argus_result.json` artifact for Operator and higher layers
+1. Configure environment from `.env.example`:
 
-## Design Goals
+```bash
+cp .env.example .env.local
+# set ARGUS_WORKSPACE_ROOT, OPERATOR_ROOT, optional JUNE_WORKSPACE_ROOT/ATLAS_WORKSPACE_ROOT
+```
 
-ARGUS exists so execution can be aggressive without becoming sovereign.
+2. Run a bounded status path:
 
-It is intentionally constrained:
+```bash
+bin/argus-research-run status
+```
 
-- June owns mission truth and dispatch truth
-- Operator owns project truth
-- ARGUS owns execution-local attempts and attempt-local artifacts only
-
-That boundary is the point.
-ARGUS can do real work, recover from stale dispatch locks, and carry enough
-identity to be auditable, but it is not allowed to become a second planner.
-
-## What Is In This Repository
-
-- bounded execution entrypoints
-- result-contract generation
-- delegation glue from ARGUS to ATLAS
-- execution safety checks around identity and duplicate dispatch
-- tests for the public contract surface
-
-## Result Contract
-
-The main public output is `argus_result.json`.
-
-That contract records things such as:
-
-- mission and dispatch identity
-- bound project identity when present
-- attempt identity and run directory
-- overall execution outcome
-- recommendation and failure classification
-- downstream ATLAS outcome when validation was delegated
-
-See:
-
-- `ARGUS_RESULT_CONTRACT.md`
-- `lib/argus_result_contract.py`
-
-## Configuration
-
-Copy `.env.example` into your local environment management and set:
-
-- `ARGUS_WORKSPACE_ROOT`
-- `OPERATOR_ROOT`
-- optionally `JUNE_WORKSPACE_ROOT`
-- optionally `ATLAS_WORKSPACE_ROOT`
-
-## Test
+3. Run tests:
 
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
-## How It Fits Into The Stack
+## Public Contract
 
-ARGUS is most useful as the execution arm of Operator, not as a standalone
-agent product.
+ARGUS publishes `argus_result.json` with mission/dispatch/project identity,
+attempt metadata, overall outcome, recommendation, and failure classification.
 
-- Operator decides what project state means
-- ARGUS performs bounded execution attempts
-- ATLAS validates or challenges those attempts
+- Contract spec: `ARGUS_RESULT_CONTRACT.md`
+- Reference implementation: `lib/argus_result_contract.py`
 
-For cross-repo wiring and environment variables, see:
+## Stack Integration
+
+- Operator: project truth and control-plane authority
+- ARGUS: bounded execution attempts
+- ATLAS: bounded validation output for executed attempts
+
+Cross-repo wiring and environment conventions:
 [operator-control-plane/docs/STACK_SETUP.md](https://github.com/Mickdownunder/operator-control-plane/blob/main/docs/STACK_SETUP.md)
