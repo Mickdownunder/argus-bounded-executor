@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARGUS_WORKSPACE_ROOT="${ARGUS_WORKSPACE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+ATLAS_WORKSPACE_ROOT="${ATLAS_WORKSPACE_ROOT:-/root/agent/atlas/workspace}"
+OPERATOR_ROOT="${OPERATOR_ROOT:-/root/operator}"
+
+usage() {
+  cat <<USAGE
+Usage:
+  argus-delegate-atlas <status|research|full|mini> [request_text]
+USAGE
+}
+
+run_with_heartbeat() {
+  local timeout_sec="$1"
+  shift
+  local -a cmd=("$@")
+  local hb_sec="${HEARTBEAT_SEC:-10}"
+  local tmp
+  tmp="$(mktemp)"
+
+  if [[ "$timeout_sec" =~ ^[0-9]+$ ]] && [[ "$timeout_sec" -gt 0 ]]; then
+    timeout --foreground --signal=TERM "$timeout_sec" "${cmd[@]}" >"$tmp" 2>&1 &
+  else
+    "${cmd[@]}" >"$tmp" 2>&1 &
+  fi
+
+  local pid=$!
+  local start_ts
+  start_ts="$(date +%s)"
+
+  while true; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    local pstat
+    pstat="$(ps -o stat= -p "$pid" 2>/dev/null | awk '{print $1}' || true)"
+    if [[ -z "$pstat" || "$pstat" == Z* ]]; then
+      break
+    fi
+    local now elapsed
+    now="$(date +%s)"
+    elapsed=$((now - start_ts))
+    printf 'HEARTBEAT delegate=argus->atlas elapsed=%ss\n' "$elapsed" >&2
+    sleep "$hb_sec"
+  done
+
+  local rc=0
+  wait "$pid" || rc=$?
+  cat "$tmp"
+  rm -f "$tmp"
+  return "$rc"
+}
+
+validate_atlas_contract() {
+  local path="$1"
+  ATLAS_CONTRACT_PATH="$path" ATLAS_WORKSPACE_ROOT="$ATLAS_WORKSPACE_ROOT" python3 - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.environ["ATLAS_WORKSPACE_ROOT"])
+from lib.atlas_validation_contract import load_contract
+
+load_contract(os.environ["ATLAS_CONTRACT_PATH"])
+PY
+}
+
+emit_fail_contract() {
+  local reason_code="$1"
+  local terminal_reason="$2"
+  local failure_class="$3"
+  local run_dir="${4:-}"
+  local summary_file="${5:-}"
+  local attempt_id="${6:-}"
+  cat <<OUT
+MISSION_ID=${MISSION_ID}
+PROJECT_ID=${PROJECT_ID}
+DISPATCH_ID=${DISPATCH_ID}
+ATTEMPT_ID=${attempt_id}
+RUN_DIR=${run_dir}
+SUMMARY_FILE=${summary_file}
+OVERALL=FAIL
+RECOMMENDATION=stop
+REASON_CODE=${reason_code}
+TERMINAL_REASON=${terminal_reason}
+FAILURE_CLASS=${failure_class}
+OUT
+}
+
+if [[ ${1:-} == "" || ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+PLAN="$1"
+REQUEST_TEXT="${2:-}"
+case "$PLAN" in
+  status|research|full|mini) ;;
+  *)
+    echo "Invalid plan: $PLAN" >&2
+    usage
+    exit 2
+    ;;
+esac
+
+atlas_cmd=(bash "$ATLAS_WORKSPACE_ROOT/bin/atlas-sandbox-run" "$PLAN")
+MISSION_ID="${ATLAS_MISSION_ID:-${ARGUS_MISSION_ID:-${JUNE_MISSION_ID:-}}}"
+DISPATCH_ID="${ATLAS_DISPATCH_ID:-${ARGUS_DISPATCH_ID:-${JUNE_DISPATCH_ID:-}}}"
+PROJECT_ID="${ATLAS_OPERATOR_PROJECT_ID:-${ARGUS_OPERATOR_PROJECT_ID:-${JUNE_PROJECT_ID:-}}}"
+if [[ -n "$REQUEST_TEXT" ]]; then
+  atlas_cmd+=("$REQUEST_TEXT")
+fi
+
+if [[ -n "${ATLAS_DELEGATION_TIMEOUT_SEC:-}" ]]; then
+  ATLAS_DELEGATION_TIMEOUT_SEC="${ATLAS_DELEGATION_TIMEOUT_SEC}"
+else
+  case "$PLAN" in
+    status) ATLAS_DELEGATION_TIMEOUT_SEC=180 ;;
+    mini|research|full) ATLAS_DELEGATION_TIMEOUT_SEC=0 ;;
+    *) ATLAS_DELEGATION_TIMEOUT_SEC=600 ;;
+  esac
+fi
+
+rc=0
+out=""
+out="$(ATLAS_MISSION_ID="$MISSION_ID" ATLAS_DISPATCH_ID="$DISPATCH_ID" ATLAS_OPERATOR_PROJECT_ID="$PROJECT_ID" run_with_heartbeat "$ATLAS_DELEGATION_TIMEOUT_SEC" "${atlas_cmd[@]}")" || rc=$?
+run_dir="$(printf "%s\n" "$out" | awk -F= '/^RUN_DIR=/{print $2; exit}')"
+summary_file="$(printf "%s\n" "$out" | awk -F= '/^SUMMARY_FILE=/{print $2; exit}')"
+attempt_id="$(printf "%s\n" "$out" | awk -F= '/^ATTEMPT_ID=/{print $2; exit}')"
+contract_path=""
+if [[ -n "$run_dir" ]]; then
+  contract_path="$run_dir/atlas_validation.json"
+fi
+
+if [[ $rc -ne 0 ]]; then
+  printf "%s\n" "$out" >&2
+  reason_code="$(printf "%s\n" "$out" | awk -F= '/^REASON_CODE=/{print $2; exit}')"
+  terminal_reason="$(printf "%s\n" "$out" | awk -F= '/^TERMINAL_REASON=/{print $2; exit}')"
+  failure_class="$(printf "%s\n" "$out" | awk -F= '/^FAILURE_CLASS=/{print $2; exit}')"
+  if [[ -n "$contract_path" && -f "$contract_path" ]] && ! validate_atlas_contract "$contract_path" >/dev/null 2>&1; then
+    reason_code="artifact_malformed"
+    terminal_reason="atlas_validation_contract_invalid"
+    failure_class="contract_failure"
+  fi
+  if [[ "$rc" -eq 124 ]]; then
+    [[ -z "$reason_code" ]] && reason_code="atlas_delegation_timeout"
+    [[ -z "$terminal_reason" ]] && terminal_reason="atlas_delegation_timeout"
+    [[ -z "$failure_class" ]] && failure_class="timeout"
+  else
+    [[ -z "$reason_code" ]] && reason_code="atlas_delegate_failed"
+    [[ -z "$terminal_reason" ]] && terminal_reason="atlas_delegate_failed"
+    [[ -z "$failure_class" ]] && failure_class="validation_failure"
+  fi
+  emit_fail_contract "$reason_code" "$terminal_reason" "$failure_class" "$run_dir" "$summary_file" "$attempt_id"
+  exit 1
+fi
+
+if [[ -z "$out" ]] || ! printf "%s\n" "$out" | grep -q '^OVERALL='; then
+  printf '%s\n' "atlas_delegate_parse_error=missing_OVERALL" >&2
+  printf "%s\n" "$out" >&2
+  emit_fail_contract "contract_invalid" "atlas_delegate_missing_overall" "contract_failure" "$run_dir" "$summary_file" "$attempt_id"
+  exit 1
+fi
+
+if [[ -z "$contract_path" || ! -f "$contract_path" ]]; then
+  emit_fail_contract "artifact_missing" "atlas_validation_artifact_missing" "contract_failure" "$run_dir" "$summary_file" "$attempt_id"
+  exit 1
+fi
+if ! validate_atlas_contract "$contract_path" >/dev/null 2>&1; then
+  emit_fail_contract "artifact_malformed" "atlas_validation_contract_invalid" "contract_failure" "$run_dir" "$summary_file" "$attempt_id"
+  exit 1
+fi
+
+printf "%s\n" "$out" | awk '
+  /^MISSION_ID=/{print; next}
+  /^PROJECT_ID=/{print; next}
+  /^DISPATCH_ID=/{print; next}
+  /^ATTEMPT_ID=/{print; next}
+  /^RUN_DIR=/{print; next}
+  /^SUMMARY_FILE=/{print; next}
+  /^OVERALL=/{print; next}
+  /^RECOMMENDATION=/{print; next}
+  /^REASON_CODE=/{print; next}
+  /^TERMINAL_REASON=/{print; next}
+  /^FAILURE_CLASS=/{print; next}
+'
+
+LOG_DIR="$OPERATOR_ROOT/logs"
+LOG_FILE="$LOG_DIR/agent-activity.jsonl"
+mkdir -p "$LOG_DIR"
+overall=""
+recommendation=""
+while IFS= read -r line; do
+  case "$line" in
+    OVERALL=*) overall="${line#OVERALL=}" ;;
+    RECOMMENDATION=*) recommendation="${line#RECOMMENDATION=}" ;;
+  esac
+done <<< "$out"
+
+if [[ -n "$REQUEST_TEXT" ]]; then
+  CMD_STR="atlas-sandbox-run $PLAN \"$REQUEST_TEXT\""
+else
+  CMD_STR="atlas-sandbox-run $PLAN"
+fi
+jq -cn \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg from "argus" --arg to "atlas" --arg plan "$PLAN" \
+  --arg request "$REQUEST_TEXT" \
+  --arg command "$CMD_STR" \
+  --arg overall "${overall:-}" --arg recommendation "${recommendation:-}" \
+  --arg run_dir "${run_dir:-}" \
+  '{ts:$ts, from:$from, to:$to, plan:$plan, request:$request, command:$command, overall:$overall, recommendation:$recommendation, run_dir:$run_dir}' >> "$LOG_FILE" 2>/dev/null || true

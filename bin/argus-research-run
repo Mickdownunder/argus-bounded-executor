@@ -1,0 +1,582 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARGUS_WORKSPACE_ROOT="${ARGUS_WORKSPACE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+OPERATOR_ROOT="${OPERATOR_ROOT:-/root/operator}"
+JUNE_WORKSPACE_ROOT="${JUNE_WORKSPACE_ROOT:-/root/agent/workspace}"
+
+BASE_LOG_DIR="$ARGUS_WORKSPACE_ROOT/logs/seq"
+DISPATCH_LOCK_DIR="$ARGUS_WORKSPACE_ROOT/logs/dispatch"
+mkdir -p "$BASE_LOG_DIR" "$DISPATCH_LOCK_DIR"
+
+usage() {
+  cat <<USAGE
+Usage:
+  argus-research-run <plan> [request_text]
+
+Plans:
+  status      health + recent jobs
+  research    health + research init + research cycle
+  full        status + research (no factory/queue)
+  mini        health + mini policy trio (ES/default/strong)
+USAGE
+}
+
+run_with_heartbeat() {
+  local timeout_sec="$1"
+  local label="$2"
+  shift 2
+  local -a cmd=("$@")
+  local hb_sec="${HEARTBEAT_SEC:-10}"
+  local tmp
+  tmp="$(mktemp)"
+
+  if [[ "$timeout_sec" =~ ^[0-9]+$ ]] && [[ "$timeout_sec" -gt 0 ]]; then
+    timeout --foreground --signal=TERM "$timeout_sec" "${cmd[@]}" >"$tmp" 2>&1 &
+  else
+    "${cmd[@]}" >"$tmp" 2>&1 &
+  fi
+  local pid=$!
+  local start_ts
+  start_ts="$(date +%s)"
+
+  while true; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    local pstat
+    pstat="$(ps -o stat= -p "$pid" 2>/dev/null | awk '{print $1}' || true)"
+    if [[ -z "$pstat" || "$pstat" == Z* ]]; then
+      break
+    fi
+    local now elapsed
+    now="$(date +%s)"
+    elapsed=$((now - start_ts))
+    printf 'HEARTBEAT %s elapsed=%ss\n' "$label" "$elapsed" >&2
+    sleep "$hb_sec"
+  done
+
+  local rc=0
+  wait "$pid" || rc=$?
+  cat "$tmp"
+  rm -f "$tmp"
+  return "$rc"
+}
+
+is_probe_request() {
+  local text="$1"
+  [[ "$text" =~ validation|probe|stack-check|stack_check|consistency|smoke|blitz|flow|failpath|gate\ probe|long-run\ mission-control ]]
+}
+
+is_operator_research_request() {
+  local text="$1"
+  [[ "$text" =~ research|thesis|hypothesis|reflective|(^|[^a-z])es([^a-z]|$)|benchmark|compare|comparison|experiment|claim|evidence|optimizer|ppl ]]
+}
+
+if [[ ${1:-} == "" || ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+PLAN="$1"
+REQUEST_TEXT="${2:-}"
+MISSION_ID="${ARGUS_MISSION_ID:-${JUNE_MISSION_ID:-}}"
+DISPATCH_ID="${ARGUS_DISPATCH_ID:-${JUNE_DISPATCH_ID:-}}"
+PROJECT_ID="${ARGUS_OPERATOR_PROJECT_ID:-${JUNE_PROJECT_ID:-}}"
+TS="$(date +%Y%m%d-%H%M%S)"
+ATTEMPT_ID="${ARGUS_ATTEMPT_ID:-argus-${TS}-${RANDOM}}"
+RUN_DIR="$BASE_LOG_DIR/${TS}-${PLAN}"
+mkdir -p "$RUN_DIR"
+SUMMARY_FILE="$RUN_DIR/summary.txt"
+RESULT_JSON="$RUN_DIR/argus_result.json"
+PROJECT_ID_FILE="$RUN_DIR/operator_project_id.txt"
+PREBOUND_PROJECT_ID="${ARGUS_OPERATOR_PROJECT_ID:-}"
+LOCK_FILE=""
+LOCK_ACQUIRED="0"
+STALE_LOCK_RECOVERED="0"
+LOCK_STALE_SEC="${ARGUS_DISPATCH_STALE_SEC:-14400}"
+
+ERROR_CLASS=""
+REASON_CODE=""
+TERMINAL_REASON=""
+FAILURE_CLASS=""
+overall="FAIL"
+recommendation="stop"
+atlas_run_dir=""
+atlas_summary_file=""
+atlas_overall="SKIPPED"
+atlas_recommendation="stop"
+
+write_argus_result_artifact() {
+  local project_id="$PROJECT_ID"
+  if [[ -f "$PROJECT_ID_FILE" ]]; then
+    project_id="$(cat "$PROJECT_ID_FILE")"
+  fi
+  ARGUS_RESULT_PATH="$RESULT_JSON" \
+  ARGUS_MISSION_ID="$MISSION_ID" \
+  ARGUS_DISPATCH_ID="$DISPATCH_ID" \
+  ARGUS_PROJECT_ID="$project_id" \
+  ARGUS_ATTEMPT_ID="$ATTEMPT_ID" \
+  ARGUS_RUN_DIR="$RUN_DIR" \
+  ARGUS_SUMMARY_FILE="$SUMMARY_FILE" \
+  ARGUS_OVERALL="$overall" \
+  ARGUS_RECOMMENDATION="$recommendation" \
+  ARGUS_REASON_CODE="$REASON_CODE" \
+  ARGUS_TERMINAL_REASON="$TERMINAL_REASON" \
+  ARGUS_FAILURE_CLASS="$FAILURE_CLASS" \
+  ARGUS_ATLAS_OVERALL="$atlas_overall" \
+  ARGUS_ATLAS_RECOMMENDATION="$atlas_recommendation" \
+  ARGUS_ATLAS_RUN_DIR="$atlas_run_dir" \
+  ARGUS_ATLAS_SUMMARY_FILE="$atlas_summary_file" \
+  ARGUS_STALE_LOCK_RECOVERED="$STALE_LOCK_RECOVERED" \
+  ARGUS_WORKSPACE_ROOT="$ARGUS_WORKSPACE_ROOT" \
+  python3 - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.environ["ARGUS_WORKSPACE_ROOT"])
+from lib.argus_result_contract import write_contract
+
+write_contract(
+    os.environ["ARGUS_RESULT_PATH"],
+    {
+        "mission_id": os.environ.get("ARGUS_MISSION_ID", ""),
+        "dispatch_id": os.environ.get("ARGUS_DISPATCH_ID", ""),
+        "project_id": os.environ.get("ARGUS_PROJECT_ID", ""),
+        "attempt_id": os.environ["ARGUS_ATTEMPT_ID"],
+        "run_dir": os.environ["ARGUS_RUN_DIR"],
+        "summary_file": os.environ["ARGUS_SUMMARY_FILE"],
+        "overall": os.environ["ARGUS_OVERALL"],
+        "recommendation": os.environ["ARGUS_RECOMMENDATION"],
+        "reason_code": os.environ.get("ARGUS_REASON_CODE", ""),
+        "terminal_reason": os.environ.get("ARGUS_TERMINAL_REASON", ""),
+        "failure_class": os.environ.get("ARGUS_FAILURE_CLASS", ""),
+        "atlas_overall": os.environ.get("ARGUS_ATLAS_OVERALL", ""),
+        "atlas_recommendation": os.environ.get("ARGUS_ATLAS_RECOMMENDATION", ""),
+        "atlas_run_dir": os.environ.get("ARGUS_ATLAS_RUN_DIR", ""),
+        "atlas_summary_file": os.environ.get("ARGUS_ATLAS_SUMMARY_FILE", ""),
+        "stale_lock_recovered": os.environ.get("ARGUS_STALE_LOCK_RECOVERED", "0") == "1",
+    },
+)
+PY
+}
+
+release_dispatch_lock() {
+  if [[ "$LOCK_ACQUIRED" == "1" && -n "$LOCK_FILE" ]]; then
+    rm -f "$LOCK_FILE" || true
+  fi
+}
+
+emit_contract_stdout() {
+  cat <<OUT
+MISSION_ID=$MISSION_ID
+PROJECT_ID=$PROJECT_ID
+DISPATCH_ID=$DISPATCH_ID
+ATTEMPT_ID=$ATTEMPT_ID
+RUN_DIR=$RUN_DIR
+SUMMARY_FILE=$SUMMARY_FILE
+RESULT_JSON=$RESULT_JSON
+OVERALL=$overall
+RECOMMENDATION=$recommendation
+ATLAS_RUN_DIR=$atlas_run_dir
+ATLAS_SUMMARY_FILE=$atlas_summary_file
+ATLAS_OVERALL=$atlas_overall
+ATLAS_RECOMMENDATION=$atlas_recommendation
+ERROR_CLASS=$ERROR_CLASS
+REASON_CODE=$REASON_CODE
+TERMINAL_REASON=$TERMINAL_REASON
+FAILURE_CLASS=$FAILURE_CLASS
+OUT
+}
+
+finalize_failure() {
+  write_argus_result_artifact
+  emit_contract_stdout
+  exit 1
+}
+
+acquire_dispatch_lock() {
+  if [[ -z "$DISPATCH_ID" ]]; then
+    return 0
+  fi
+  LOCK_FILE="$DISPATCH_LOCK_DIR/${DISPATCH_ID}.lock"
+  if ( set -o noclobber; printf 'pid=%s\nts=%s\nattempt_id=%s\n' "$$" "$(date +%s)" "$ATTEMPT_ID" > "$LOCK_FILE" ) 2>/dev/null; then
+    LOCK_ACQUIRED="1"
+    return 0
+  fi
+  local existing_pid existing_ts now
+  existing_pid="$(awk -F= '/^pid=/{print $2; exit}' "$LOCK_FILE" 2>/dev/null || true)"
+  existing_ts="$(awk -F= '/^ts=/{print $2; exit}' "$LOCK_FILE" 2>/dev/null || true)"
+  now="$(date +%s)"
+  if [[ -n "$existing_pid" && -n "$existing_ts" ]] && kill -0 "$existing_pid" 2>/dev/null && (( now - existing_ts < LOCK_STALE_SEC )); then
+    ERROR_CLASS="ARGUS_DUPLICATE_DISPATCH"
+    REASON_CODE="duplicate_dispatch_blocked"
+    TERMINAL_REASON="argus_dispatch_already_active"
+    FAILURE_CLASS="resource_contention"
+    finalize_failure
+  fi
+  if ! rm -f "$LOCK_FILE"; then
+    ERROR_CLASS="ARGUS_STALE_LOCK_FAILED"
+    REASON_CODE="stale_lock_failed"
+    TERMINAL_REASON="argus_dispatch_lock_recovery_failed"
+    FAILURE_CLASS="resource_contention"
+    finalize_failure
+  fi
+  STALE_LOCK_RECOVERED="1"
+  if ( set -o noclobber; printf 'pid=%s\nts=%s\nattempt_id=%s\n' "$$" "$(date +%s)" "$ATTEMPT_ID" > "$LOCK_FILE" ) 2>/dev/null; then
+    LOCK_ACQUIRED="1"
+    return 0
+  fi
+  ERROR_CLASS="ARGUS_STALE_LOCK_FAILED"
+  REASON_CODE="stale_lock_failed"
+  TERMINAL_REASON="argus_dispatch_lock_recovery_failed"
+  FAILURE_CLASS="resource_contention"
+  finalize_failure
+}
+
+validate_identity_binding() {
+  if [[ -n "$DISPATCH_ID" && -z "$MISSION_ID" ]]; then
+    DISPATCH_ID=""
+    ERROR_CLASS="INVALID_IDENTITY_BINDING"
+    REASON_CODE="contract_invalid"
+    TERMINAL_REASON="mission_id_required_for_dispatch_id"
+    FAILURE_CLASS="contract_failure"
+    finalize_failure
+  fi
+  if [[ -n "$MISSION_ID" && -z "$DISPATCH_ID" ]]; then
+    MISSION_ID=""
+    ERROR_CLASS="INVALID_IDENTITY_BINDING"
+    REASON_CODE="contract_invalid"
+    TERMINAL_REASON="dispatch_id_required_for_mission_id"
+    FAILURE_CLASS="contract_failure"
+    finalize_failure
+  fi
+}
+
+trap release_dispatch_lock EXIT
+
+if [[ -n "$PREBOUND_PROJECT_ID" ]] && [[ ! "$PREBOUND_PROJECT_ID" =~ ^proj-[A-Za-z0-9_-]+$ ]]; then
+  ERROR_CLASS="INVALID_PROJECT_BINDING"
+  REASON_CODE="contract_invalid"
+  TERMINAL_REASON="invalid_prebound_project_id"
+  FAILURE_CLASS="contract_failure"
+  finalize_failure
+fi
+if [[ -n "$PREBOUND_PROJECT_ID" ]]; then
+  printf '%s\n' "$PREBOUND_PROJECT_ID" > "$PROJECT_ID_FILE"
+  PROJECT_ID="$PREBOUND_PROJECT_ID"
+fi
+
+validate_identity_binding
+acquire_dispatch_lock
+
+GATE_MODE="${GATE_MODE:-strict}"
+if [[ "$REQUEST_TEXT" =~ gate=strict ]]; then
+  GATE_MODE="strict"
+elif [[ "$REQUEST_TEXT" =~ gate=warn|gate=ignore|skip_health|Gate\ ignorieren|gate\ ignorieren|smoke|blitz|flow ]]; then
+  GATE_MODE="warn"
+fi
+
+SKIP_HEALTH_GATE="0"
+if [[ "$GATE_MODE" == "warn" ]]; then
+  SKIP_HEALTH_GATE="1"
+fi
+
+PROBE_MODE="0"
+if [[ "$PLAN" =~ ^(research|full)$ ]] && is_probe_request "$REQUEST_TEXT"; then
+  PROBE_MODE="1"
+fi
+
+if [[ "$PLAN" =~ ^(research|full)$ ]] && [[ "$PROBE_MODE" != "1" ]] && ! is_operator_research_request "$REQUEST_TEXT"; then
+  ERROR_CLASS="INVALID_OPERATOR_ROUTING"
+  REASON_CODE="invalid_operator_routing"
+  TERMINAL_REASON="operator_research_request_denied"
+  FAILURE_CLASS="routing_failure"
+  {
+    echo "timestamp=$(date -Is)"
+    echo "plan=$PLAN"
+    echo "request_text=$REQUEST_TEXT"
+    echo "probe_mode=$PROBE_MODE"
+    echo "gate_mode=$GATE_MODE"
+    echo "mission_id=$MISSION_ID"
+    echo "dispatch_id=$DISPATCH_ID"
+    echo "attempt_id=$ATTEMPT_ID"
+    echo "project_id=$PROJECT_ID"
+    echo "run_dir=$RUN_DIR"
+    echo "result_json=$RESULT_JSON"
+    echo "overall=$overall"
+    echo "recommendation=$recommendation"
+    echo "atlas_run_dir=$atlas_run_dir"
+    echo "atlas_summary_file=$atlas_summary_file"
+    echo "atlas_overall=$atlas_overall"
+    echo "atlas_recommendation=$atlas_recommendation"
+    echo "error_class=$ERROR_CLASS"
+    echo "reason_code=$REASON_CODE"
+    echo "terminal_reason=$TERMINAL_REASON"
+    echo "failure_class=$FAILURE_CLASS"
+    echo "steps_begin"
+    echo "steps_end"
+  } > "$SUMMARY_FILE"
+  finalize_failure
+fi
+
+steps=()
+case "$PLAN" in
+  status)
+    [[ "$SKIP_HEALTH_GATE" != "1" ]] && steps+=("healthcheck")
+    steps+=("job_status")
+    ;;
+  research)
+    [[ "$SKIP_HEALTH_GATE" != "1" ]] && steps+=("healthcheck")
+    if [[ "$PROBE_MODE" == "1" ]]; then
+      steps+=("job_status")
+    else
+      if [[ -z "$PREBOUND_PROJECT_ID" ]]; then
+        steps+=("research_init")
+      fi
+      steps+=("research_cycle")
+    fi
+    ;;
+  full)
+    [[ "$SKIP_HEALTH_GATE" != "1" ]] && steps+=("healthcheck")
+    steps+=("job_status")
+    if [[ "$PROBE_MODE" != "1" ]]; then
+      if [[ -z "$PREBOUND_PROJECT_ID" ]]; then
+        steps+=("research_init")
+      fi
+      steps+=("research_cycle")
+    fi
+    ;;
+  mini)
+    [[ "$SKIP_HEALTH_GATE" != "1" ]] && steps+=("healthcheck_warn")
+    if [[ "$REQUEST_TEXT" =~ mini_fast|atlas_first ]]; then
+      steps+=("job_status")
+    else
+      steps+=("mini_series")
+    fi
+    ;;
+  *)
+    echo "Unknown plan: $PLAN" >&2
+    usage
+    exit 2
+    ;;
+esac
+
+run_step() {
+  local step="$1"
+  local idx="$2"
+  local log_file="$RUN_DIR/step-${idx}-${step}.log"
+  local -a cmd
+
+  case "$step" in
+    healthcheck)
+      cmd=("$OPERATOR_ROOT/bin/oc-healthcheck")
+      ;;
+    healthcheck_warn)
+      cmd=("$OPERATOR_ROOT/bin/oc-healthcheck")
+      ;;
+    job_status)
+      cmd=("$OPERATOR_ROOT/bin/oc-job-status" 20)
+      ;;
+    research_init)
+      if [[ -z "$REQUEST_TEXT" ]]; then
+        cmd=("$OPERATOR_ROOT/bin/oc-research-init")
+      else
+        cmd=("$OPERATOR_ROOT/bin/oc-research-init" "$REQUEST_TEXT")
+      fi
+      ;;
+    research_cycle)
+      if [[ ! -f "$PROJECT_ID_FILE" ]]; then
+        echo "missing_project_id" >> "$log_file"
+        echo "FAIL"
+        return 1
+      fi
+      local project_id
+      project_id="$(cat "$PROJECT_ID_FILE")"
+      cmd=("$OPERATOR_ROOT/bin/oc-research-cycle" "$project_id")
+      ;;
+    mini_series)
+      local seed="2026"
+      local max_tokens="120000"
+      local target_ppl="22.0"
+      local mini_cases="all"
+      if [[ "$REQUEST_TEXT" =~ seed=([0-9]+) ]]; then
+        seed="${BASH_REMATCH[1]}"
+      fi
+      if [[ "$REQUEST_TEXT" =~ max_tokens=([0-9]+) ]]; then
+        max_tokens="${BASH_REMATCH[1]}"
+      fi
+      if [[ "$REQUEST_TEXT" =~ target_ppl=([0-9]+\.?[0-9]*) ]]; then
+        target_ppl="${BASH_REMATCH[1]}"
+      fi
+      if [[ "$REQUEST_TEXT" =~ mini_cases=([a-zA-Z0-9_,-]+) ]]; then
+        mini_cases="${BASH_REMATCH[1]}"
+      fi
+      cmd=(bash "$JUNE_WORKSPACE_ROOT/bin/june-mini-series" "$seed" "$max_tokens" "$target_ppl" "$mini_cases")
+      ;;
+    *)
+      echo "unknown step: $step" >&2
+      return 127
+      ;;
+  esac
+
+  {
+    echo "timestamp=$(date -Is)"
+    echo "plan=$PLAN"
+    echo "step=$step"
+    echo "probe_mode=$PROBE_MODE"
+    echo "command=${cmd[*]}"
+    echo "---"
+  } > "$log_file"
+
+  if [[ "$step" == "healthcheck_warn" ]]; then
+    "${cmd[@]}" >> "$log_file" 2>&1; ec=$?
+    if [[ $ec -ne 0 ]]; then
+      echo "healthcheck_warn=unhealthy (see step log for load_ok/disk_ok)" >> "$RUN_DIR/healthcheck_warn.txt"
+      echo "WARN"
+      return 0
+    fi
+    echo "PASS"
+    return 0
+  fi
+
+  if "${cmd[@]}" >> "$log_file" 2>&1; then
+    if [[ "$step" == "research_init" ]]; then
+      local project_id
+      project_id="$(awk -F= '/^PROJECT_ID=/{print $2; exit}' "$log_file")"
+      [[ -n "$project_id" ]] || project_id="$(grep -Eo 'proj-[A-Za-z0-9_-]+' "$log_file" | tail -n 1 || true)"
+      if [[ -z "$project_id" ]]; then
+        echo "research_init_project_id_missing=1" >> "$log_file"
+        echo "FAIL"
+        return 1
+      fi
+      printf '%s\n' "$project_id" > "$PROJECT_ID_FILE"
+      PROJECT_ID="$project_id"
+    fi
+    echo "PASS"
+    return 0
+  else
+    echo "FAIL"
+    return 1
+  fi
+}
+
+overall="PASS"
+index=0
+step_rows=()
+
+for step in "${steps[@]}"; do
+  index=$((index + 1))
+  step_out=""
+  if step_out="$(run_step "$step" "$index")"; then
+    outcome="$step_out"
+  else
+    outcome="${step_out:-FAIL}"
+  fi
+  if [[ "$outcome" == "FAIL" ]]; then
+    overall="FAIL"
+    [[ -z "$REASON_CODE" ]] && REASON_CODE="argus_step_failed"
+    [[ -z "$TERMINAL_REASON" ]] && TERMINAL_REASON="argus_${step}_failed"
+    [[ -z "$FAILURE_CLASS" ]] && FAILURE_CLASS="execution_failure"
+  fi
+  log_path="$RUN_DIR/step-${index}-${step}.log"
+  step_rows+=("${index}|${step}|${outcome}|${log_path}")
+  if [[ "$outcome" == "FAIL" ]]; then
+    break
+  fi
+done
+
+if [[ "$overall" == "PASS" && "$PLAN" != "status" ]]; then
+  atlas_cmd=(bash "$ARGUS_WORKSPACE_ROOT/bin/argus-delegate-atlas" "$PLAN")
+  if [[ -n "$REQUEST_TEXT" ]]; then
+    atlas_cmd+=("$REQUEST_TEXT")
+  fi
+
+  atlas_timeout_sec="${ATLAS_DELEGATION_TIMEOUT_SEC:-10800}"
+  atlas_output=""
+  if [[ -n "$PREBOUND_PROJECT_ID" ]]; then
+    if atlas_output="$(ATLAS_OPERATOR_PROJECT_ID="$PREBOUND_PROJECT_ID" ATLAS_MISSION_ID="$MISSION_ID" ATLAS_DISPATCH_ID="$DISPATCH_ID" run_with_heartbeat "$atlas_timeout_sec" "argus->atlas" "${atlas_cmd[@]}")"; then
+      atlas_run_dir="$(printf '%s\n' "$atlas_output" | awk -F= '/^RUN_DIR=/{print $2; exit}')"
+      atlas_summary_file="$(printf '%s\n' "$atlas_output" | awk -F= '/^SUMMARY_FILE=/{print $2; exit}')"
+      atlas_overall="$(printf '%s\n' "$atlas_output" | awk -F= '/^OVERALL=/{print $2; exit}')"
+      atlas_recommendation="$(printf '%s\n' "$atlas_output" | awk -F= '/^RECOMMENDATION=/{print $2; exit}')"
+    else
+      atlas_overall="FAIL"
+      atlas_recommendation="stop"
+    fi
+  elif atlas_output="$(ATLAS_MISSION_ID="$MISSION_ID" ATLAS_DISPATCH_ID="$DISPATCH_ID" run_with_heartbeat "$atlas_timeout_sec" "argus->atlas" "${atlas_cmd[@]}")"; then
+    atlas_run_dir="$(printf '%s\n' "$atlas_output" | awk -F= '/^RUN_DIR=/{print $2; exit}')"
+    atlas_summary_file="$(printf '%s\n' "$atlas_output" | awk -F= '/^SUMMARY_FILE=/{print $2; exit}')"
+    atlas_overall="$(printf '%s\n' "$atlas_output" | awk -F= '/^OVERALL=/{print $2; exit}')"
+    atlas_recommendation="$(printf '%s\n' "$atlas_output" | awk -F= '/^RECOMMENDATION=/{print $2; exit}')"
+  else
+    atlas_overall="FAIL"
+    atlas_recommendation="stop"
+    [[ -z "$ERROR_CLASS" ]] && ERROR_CLASS="ATLAS_DELEGATION_FAILED"
+    [[ -z "$REASON_CODE" ]] && REASON_CODE="atlas_delegation_failed"
+    [[ -z "$TERMINAL_REASON" ]] && TERMINAL_REASON="atlas_delegate_failed"
+    [[ -z "$FAILURE_CLASS" ]] && FAILURE_CLASS="validation_failure"
+  fi
+
+  if [[ "$atlas_overall" != "PASS" ]]; then
+    overall="FAIL"
+    atlas_recommendation="stop"
+    [[ -z "$REASON_CODE" ]] && REASON_CODE="atlas_validation_failed"
+    [[ -z "$TERMINAL_REASON" ]] && TERMINAL_REASON="atlas_validation_failed"
+    [[ -z "$FAILURE_CLASS" ]] && FAILURE_CLASS="validation_failure"
+  fi
+fi
+
+recommendation="stop"
+if [[ "$overall" == "PASS" && "$PLAN" != "status" ]]; then
+  recommendation="$atlas_recommendation"
+elif [[ "$overall" == "PASS" && "$PLAN" == "status" ]]; then
+  recommendation="more_runs"
+fi
+if [[ "$overall" == "PASS" && -z "$REASON_CODE" && "$STALE_LOCK_RECOVERED" == "1" ]]; then
+  REASON_CODE="stale_lock_recovered"
+  TERMINAL_REASON="argus_dispatch_lock_recovered"
+fi
+
+{
+  echo "timestamp=$(date -Is)"
+  echo "plan=$PLAN"
+  echo "request_text=$REQUEST_TEXT"
+  echo "probe_mode=$PROBE_MODE"
+  echo "gate_mode=$GATE_MODE"
+  echo "mission_id=$MISSION_ID"
+  echo "dispatch_id=$DISPATCH_ID"
+  echo "attempt_id=$ATTEMPT_ID"
+  echo "prebound_project_id=$PREBOUND_PROJECT_ID"
+  echo "project_id=$PROJECT_ID"
+  echo "run_dir=$RUN_DIR"
+  echo "result_json=$RESULT_JSON"
+  echo "overall=$overall"
+  echo "recommendation=$recommendation"
+  echo "atlas_run_dir=$atlas_run_dir"
+  echo "atlas_summary_file=$atlas_summary_file"
+  echo "atlas_overall=$atlas_overall"
+  echo "atlas_recommendation=$atlas_recommendation"
+  [[ -n "$ERROR_CLASS" ]] && echo "error_class=$ERROR_CLASS"
+  [[ -n "$REASON_CODE" ]] && echo "reason_code=$REASON_CODE"
+  [[ -n "$TERMINAL_REASON" ]] && echo "terminal_reason=$TERMINAL_REASON"
+  [[ -n "$FAILURE_CLASS" ]] && echo "failure_class=$FAILURE_CLASS"
+  if [[ -f "$PROJECT_ID_FILE" ]]; then
+    PROJECT_ID="$(cat "$PROJECT_ID_FILE")"
+    echo "operator_project_id=$PROJECT_ID"
+  fi
+  echo "steps_begin"
+  for row in "${step_rows[@]}"; do
+    echo "$row"
+  done
+  echo "steps_end"
+  [[ -f "$RUN_DIR/healthcheck_warn.txt" ]] && cat "$RUN_DIR/healthcheck_warn.txt"
+} > "$SUMMARY_FILE"
+
+write_argus_result_artifact
+emit_contract_stdout
+
+if [[ "$overall" == "FAIL" ]]; then
+  exit 1
+fi
