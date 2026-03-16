@@ -1,7 +1,18 @@
-# Argus Workspace
+# argus-bounded-executor
 
-Argus is a bounded June-owned research executor. This workspace owns only local run artifacts,
-summaries, and the canonical Argus result contract.
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Stack Setup](https://img.shields.io/badge/docs-stack%20setup-black.svg)](https://github.com/Mickdownunder/operator-control-plane/blob/main/docs/STACK_SETUP.md)
+
+`argus-bounded-executor` is the bounded execution layer of the Operator research
+stack. ARGUS runs delegated work inside explicit runtime limits and produces the
+canonical result contract that Operator can ingest.
+
+## What This Repo Contains
+
+- bounded research and delegation entrypoints
+- deterministic result-contract generation
+- small validation helpers around execution outcomes
+- tests for the public contract surface
 
 ## Canonical entrypoints
 - `bin/argus-research-run`
